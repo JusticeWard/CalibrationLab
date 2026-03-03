@@ -1,0 +1,13 @@
+# Calibration Capture Script — Dependencies
+#
+# Install pyphantom from the local Phantom SDK wheel (not on PyPI):
+#   pip install "C:\Users\justi\OneDrive\My Documents\Phantom\PhSDK11\Python\pyphantom-3.11.11.806-py311-none-any.whl"
+#
+# Then install the rest:
+#   pip install -r requirements.txt
+
+pythonnet>=3.0.3        # .NET interop for ThorLabs Kinesis DLLs
+pyfirmata>=1.1.0        # Arduino Firmata protocol (StandardFirmata firmware on Arduino)
+numpy<2.0               # array handling (keep <2.0 for Phantom SDK compatibility)
+opencv-python>=4.5.0    # save 16-bit TIFF images
+tqdm>=4.60.0            # progress bar
