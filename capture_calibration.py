@@ -56,7 +56,9 @@ TRIGGER_TIMEOUT_S = 15.0    # Mode 1: max wait for D13 (s)
 CAPTURE_WAIT_S    = 0.5     # wait after trigger before reading frame from camera RAM
 MOVE_TIMEOUT_MS   = 20000   # max time per MoveTo call (ms)
 
-OUTPUT_BASE_DIR = Path(r'C:\Users\justi\OneDrive\Desktop\coursework\lab_capture\captures')
+OUTPUT_BASE_DIR = Path.cwd() / 'outputs'
+
+DRY_RUN = True             # Set True to simulate without hardware (overrides --dry-run)
 
 # -----------------------------------------------------------------------------
 
@@ -265,7 +267,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    dry_run = args.dry_run
+    dry_run = args.dry_run or DRY_RUN
 
     positions = np.arange(args.start, args.end + args.step / 2, args.step)
     n_pos = len(positions)
