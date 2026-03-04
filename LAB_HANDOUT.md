@@ -52,7 +52,6 @@ setup_lab_env.bat
 ### 2. Configure PCC
 1. Open PCC → confirm camera shows live view
 2. Set trigger to **External**
-3. Note current resolution and frame rate
 
 ### 3. Update script config
 Edit the top of `capture_calibration.py`:
@@ -63,8 +62,6 @@ SETTLE_S          = 0.1          # Mode 2 only: wait (s) after MoveTo() before t
 ARDUINO_PORT      = 'COM5'       # from Device Manager
 STAGE_SERIAL      = '27XXXXXX'   # 8-digit serial from Kinesis label
 STAGE_CONFIG_NAME = 'Z825B'      # actuator name from Kinesis device settings
-CAM_RESOLUTION    = (1024, 1024) # match PCC
-CAM_FRAME_RATE    = 100          # match PCC
 ```
 
 ---
