@@ -1,60 +1,25 @@
 #!/usr/bin/env python3
 """
 capture_calibration.py
-======================
+----------------------
+Z-stack capture: KDC101 stage 0–12 mm in 0.2 mm steps, one Phantom image per position.
 
-Automated calibration capture: moves the ThorLabs KDC101 stage from START_MM to
-END_MM in STEP_MM increments, capturing one Phantom camera image per position.
+Hardware
+  Arduino D8  → Camera BNC trigger input
+  Arduino GND → Camera GND
+  Mode 1 only: Arduino D13 ← KDC101 rear I/O "in-position" output
 
-Hardware connections
---------------------
-  KDC101 USB     → PC (Kinesis drivers)
-  Phantom camera → PC (PCC software, Gigabit Ethernet)
-  Arduino D8     → Camera BNC / hardware-trigger input   (camera trigger pulse)
-  Arduino GND    → Camera GND                             (common ground)
-
-  Mode 1 only:
-  Arduino D13    ← KDC101 rear I/O "in-position" output  (stage settled signal)
-
-Trigger modes
--------------
-  TRIGGER_MODE = 1  (D13 hardware signal — recommended)
-    Arduino D13 reads the KDC101 rear I/O "in-position" TTL pin.
-    Script waits for D13 HIGH before firing D8. Most robust.
-
-  TRIGGER_MODE = 2  (SDK settling — no D13 wiring needed)
-    MoveTo() is a blocking call that returns only when the encoder confirms
-    the stage has reached its target. Script then waits SETTLE_S seconds for
-    mechanical vibration to damp before firing D8. Use this if the KDC101
-    rear I/O is inaccessible or you cannot wire D13.
-
-Before running
---------------
-  1. Set TRIGGER_MODE below (1 or 2)
-  2. Flash StandardFirmata to Arduino Uno
-       Arduino IDE → File → Examples → Firmata → StandardFirmata → Upload
-  3. Open PCC, connect camera, set trigger mode to External (hardware trigger)
-  4. Edit the CONFIGURATION block below (ARDUINO_PORT, STAGE_SERIAL, etc.)
-  5. Confirm STAGE_CONFIG_NAME matches your actuator name in Kinesis software
+Trigger modes (set TRIGGER_MODE below)
+  1 — wait for D13 HIGH (KDC101 hardware "in-position" signal)
+  2 — rely on MoveTo() blocking call + SETTLE_S damping wait (no D13 wiring needed)
 
 Usage
------
-  python capture_calibration.py                     # normal run
-  python capture_calibration.py --dry-run           # test without hardware
-  python capture_calibration.py --start 5 --end 7   # custom range
-  python capture_calibration.py --out D:/captures   # custom output dir
-
-Output
-------
-  captures/capture_YYYYMMDD_HHMMSS/
-      pos_000_0.0mm.tiff
-      pos_001_0.2mm.tiff
-      ...
-      pos_060_12.0mm.tiff
-      positions.csv          ← filename, stage_position_mm  (loads into calibration_gui.py)
+  python capture_calibration.py             # full run
+  python capture_calibration.py --dry-run   # simulate without hardware
+  python capture_calibration.py --start 5 --end 7
+  python capture_calibration.py --out D:/captures
 """
 
-import sys
 import time
 import csv
 import argparse
@@ -63,7 +28,7 @@ import inspect
 from pathlib import Path
 from datetime import datetime
 
-# pyfirmata uses inspect.getargspec which was removed in Python 3.11
+# pyfirmata uses inspect.getargspec, removed in Python 3.11
 if not hasattr(inspect, 'getargspec'):
     inspect.getargspec = inspect.getfullargspec
 
@@ -72,48 +37,33 @@ import cv2
 from tqdm import tqdm
 
 
-# =============================================================================
-# CONFIGURATION — edit these before each lab session
-# =============================================================================
+# --- CONFIGURATION — edit before each session --------------------------------
 
-# ── Trigger mode ──────────────────────────────────────────────────────────────
-TRIGGER_MODE = 1
-# 1 — D13 hardware signal (recommended if KDC101 rear I/O is wired to Arduino D13)
-# 2 — SDK settling only   (no D13 wiring needed; relies on MoveTo() blocking call)
+TRIGGER_MODE = 1        # 1 = D13 hardware signal  |  2 = SDK settling (no D13 wire)
+SETTLE_S     = 0.1      # Mode 2 only: wait (s) after MoveTo() before triggering
 
-SETTLE_S          = 0.1            # Mode 2 only: seconds to wait after MoveTo() before triggering
-
-# ── Hardware ──────────────────────────────────────────────────────────────────
-ARDUINO_PORT      = 'COM3'         # Arduino COM port (check Device Manager → USB-SERIAL CH340)
-STAGE_SERIAL      = '27XXXXXX'     # 8-digit serial number on KDC101 label
+ARDUINO_PORT      = 'COM5'
+STAGE_SERIAL      = '27XXXXXX'     # 8-digit serial on KDC101 label
 KINESIS_DLL_PATH  = r'C:\Program Files\Thorlabs\Kinesis'
-STAGE_CONFIG_NAME = 'Z825B'        # actuator model name saved in Kinesis software
-                                   # (e.g. 'Z825B' for 25mm, 'Z812B' for 12mm)
+STAGE_CONFIG_NAME = 'Z825B'        # actuator name in Kinesis (e.g. Z825B, Z812B)
 
-# ── Scan parameters ───────────────────────────────────────────────────────────
-START_MM          = 0.0            # scan start position (mm)
-END_MM            = 12.0           # scan end position (mm)
-STEP_MM           = 0.2            # step size (mm) → 61 positions
+START_MM = 0.0
+END_MM   = 12.0
+STEP_MM  = 0.2          # 61 positions
 
-# ── Camera ────────────────────────────────────────────────────────────────────
-CAM_RESOLUTION    = (1024, 1024)   # camera resolution — match your PCC setting
-CAM_FRAME_RATE    = 100            # frames per second
+TRIGGER_PULSE_MS  = 50      # D8 HIGH duration (ms)
+TRIGGER_TIMEOUT_S = 15.0    # Mode 1: max wait for D13 (s)
+CAPTURE_WAIT_S    = 0.5     # wait after trigger before reading frame from camera RAM
+MOVE_TIMEOUT_MS   = 20000   # max time per MoveTo call (ms)
 
-# ── Timing ────────────────────────────────────────────────────────────────────
-TRIGGER_PULSE_MS  = 50             # D8 HIGH duration (ms)
-TRIGGER_TIMEOUT_S = 15.0           # Mode 1 only: max time to wait for D13 (stage in-position)
-CAPTURE_WAIT_S    = 0.5            # wait after D8 trigger before reading cine from RAM
-MOVE_TIMEOUT_MS   = 20000          # max time per MoveTo call (ms)
+OUTPUT_BASE_DIR = Path(r'C:\Users\justi\OneDrive\Desktop\coursework\lab_capture\captures')
 
-OUTPUT_BASE_DIR   = Path(r'C:\Users\justi\OneDrive\Desktop\coursework\lab_capture\captures')
+# -----------------------------------------------------------------------------
 
 
-# =============================================================================
-# STAGE (ThorLabs KDC101 via pythonnet + Kinesis .NET DLLs)
-# =============================================================================
+# --- Stage -------------------------------------------------------------------
 
-def init_stage(dry_run: bool = False):
-    """Connect to KDC101, load motor config, home the stage. Returns device object."""
+def init_stage(dry_run=False):
     if dry_run:
         print("[DRY RUN] Stage init skipped")
         return None
@@ -123,62 +73,54 @@ def init_stage(dry_run: bool = False):
     clr.AddReference(f"{KINESIS_DLL_PATH}\\Thorlabs.MotionControl.GenericMotorCLI.dll")
     clr.AddReference(f"{KINESIS_DLL_PATH}\\ThorLabs.MotionControl.KCube.DCServoCLI.dll")
 
-    # NOTE: Do NOT call SimulationManager.InitializeSimulations() here —
-    # that is for offline testing only and prevents real hardware from working.
-
+    # Do NOT call SimulationManager.InitializeSimulations() — for offline testing only.
     from Thorlabs.MotionControl.DeviceManagerCLI import DeviceManagerCLI, DeviceConfiguration
     from Thorlabs.MotionControl.KCube.DCServoCLI import KCubeDCServo
 
-    print("Connecting to KDC101 stage...")
+    print("Connecting to KDC101...")
     DeviceManagerCLI.BuildDeviceList()
-
     device = KCubeDCServo.CreateKCubeDCServo(STAGE_SERIAL)
     device.Connect(STAGE_SERIAL)
     time.sleep(0.25)
-    device.StartPolling(250)          # poll status every 250 ms
-    time.sleep(0.25)                  # allow settings to propagate
+    device.StartPolling(250)
+    time.sleep(0.25)
     device.EnableDevice()
     time.sleep(0.25)
 
     if not device.IsSettingsInitialized():
         device.WaitForSettingsInitialized(10000)
         if not device.IsSettingsInitialized():
-            raise RuntimeError("KDC101 settings failed to initialise after 10 s")
+            raise RuntimeError("KDC101 settings failed to initialise")
 
     m_config = device.LoadMotorConfiguration(
-        STAGE_SERIAL,
-        DeviceConfiguration.DeviceSettingsUseOptionType.UseFileSettings
+        STAGE_SERIAL, DeviceConfiguration.DeviceSettingsUseOptionType.UseFileSettings
     )
     m_config.DeviceSettingsName = STAGE_CONFIG_NAME
     m_config.UpdateCurrentConfiguration()
     device.SetSettings(device.MotorDeviceSettings, True, False)
 
-    print("Homing stage (please wait)...")
-    device.Home(60000)                # blocking, 60 s timeout
+    print("Homing stage...")
+    device.Home(60000)
     print("Stage homed.")
     return device
 
 
-def move_stage(device, target_mm: float, dry_run: bool = False):
-    """Blocking move. Returns when the encoder confirms the stage has entered the target
-    position window. The stage is at the target but may still have residual oscillation
-    (PID ringing). Mode 1 uses the D13 signal which waits for the window to be held for
-    a Kinesis-configured settling time. Mode 2 adds SETTLE_S manually for the same reason."""
+def move_stage(device, target_mm, dry_run=False):
+    # Blocking — returns when encoder confirms stage has entered the target window.
+    # Stage may still have residual oscillation; Mode 1/2 handle settling differently.
     if dry_run:
         return
     from System import Decimal
     device.MoveTo(Decimal(target_mm), MOVE_TIMEOUT_MS)
 
 
-def get_stage_position(device, dry_run: bool = False) -> float:
-    """Return current stage position in mm."""
+def get_stage_position(device, dry_run=False):
     if dry_run:
         return 0.0
     return float(str(device.Position))  # device.Position is System.Decimal
 
 
-def close_stage(device, dry_run: bool = False):
-    """Move to safe mid-position and disconnect."""
+def close_stage(device, dry_run=False):
     if dry_run or device is None:
         return
     from System import Decimal
@@ -191,12 +133,9 @@ def close_stage(device, dry_run: bool = False):
     print("Stage disconnected.")
 
 
-# =============================================================================
-# ARDUINO (pyfirmata — StandardFirmata firmware required)
-# =============================================================================
+# --- Arduino -----------------------------------------------------------------
 
-def init_arduino(dry_run: bool = False):
-    """Connect to Arduino. D8 output always; D13 input only in Mode 1."""
+def init_arduino(dry_run=False):
     if dry_run:
         print("[DRY RUN] Arduino init skipped")
         return None, None, None
@@ -206,78 +145,55 @@ def init_arduino(dry_run: bool = False):
 
     print(f"Connecting to Arduino on {ARDUINO_PORT}...")
     board = pyfirmata.Arduino(ARDUINO_PORT)
-    it = Iterator(board)
-    it.start()
-    time.sleep(2)                        # allow Firmata handshake to complete
+    Iterator(board).start()
+    time.sleep(2)  # allow Firmata handshake
 
-    d8 = board.get_pin('d:8:o')         # output: camera trigger pulse
-    d8.write(0)                          # ensure trigger starts LOW
+    d8 = board.get_pin('d:8:o')
+    d8.write(0)
 
     if TRIGGER_MODE == 1:
-        d13 = board.get_pin('d:13:i')   # input: stage "in position" signal
-        print("Arduino connected (Mode 1: D8 + D13).")
+        d13 = board.get_pin('d:13:i')
+        print("Arduino ready (Mode 1: D8 + D13).")
     else:
         d13 = None
-        print("Arduino connected (Mode 2: D8 only — D13 not used).")
+        print("Arduino ready (Mode 2: D8 only).")
 
     return board, d8, d13
 
 
-def wait_for_position_then_trigger(d8, d13, dry_run: bool = False):
-    """
-    Confirm the stage is settled at its target position, then pulse D8 to trigger camera.
-
-    Mode 1 — D13 hardware signal:
-      Polls Arduino D13 until HIGH (KDC101 "in-position" TTL output).
-      D13 LOW  = stage still moving or settling → keep waiting
-      D13 HIGH = stage confirmed in position    → fire trigger
-
-    Mode 2 — SDK settling:
-      MoveTo() is blocking and already confirmed in-position via encoder feedback.
-      Waits SETTLE_S seconds for mechanical vibration to damp, then fires trigger.
-    """
+def trigger(d8, d13, dry_run=False):
+    """Wait for stage to settle, then pulse D8 to fire the camera."""
     if dry_run:
-        if TRIGGER_MODE == 1:
-            tqdm.write("  [DRY RUN] Wait D13 HIGH, pulse D8")
-        else:
-            tqdm.write(f"  [DRY RUN] Sleep {SETTLE_S}s (Mode 2 settle), pulse D8")
+        tqdm.write("  [DRY RUN] trigger")
         return
 
     if TRIGGER_MODE == 1:
         t0 = time.time()
-        while (d13.read() or 0.0) < 0.5:    # wait while NOT in position
+        while (d13.read() or 0.0) < 0.5:
             time.sleep(0.001)
             if time.time() - t0 > TRIGGER_TIMEOUT_S:
                 raise TimeoutError(
-                    f"Stage did not reach position within {TRIGGER_TIMEOUT_S:.0f} s — "
-                    f"check D13 wiring (KDC101 rear I/O 'in-position' output → Arduino D13).\n"
-                    f"If your signal is active-LOW, flip the < 0.5 condition to > 0.5 in "
-                    f"wait_for_position_then_trigger()."
+                    f"Stage not in position after {TRIGGER_TIMEOUT_S:.0f}s — "
+                    "check D13 wiring. If signal is active-LOW, flip < 0.5 to > 0.5."
                 )
     else:
-        # Mode 2: MoveTo() has already confirmed in-position via encoder.
-        # Short sleep lets any mechanical ringing damp before the shutter fires.
-        time.sleep(SETTLE_S)
+        time.sleep(SETTLE_S)  # MoveTo() confirmed position; wait for oscillation to damp
 
-    # Stage confirmed in position — fire the camera trigger
     d8.write(1)
     time.sleep(TRIGGER_PULSE_MS / 1000.0)
     d8.write(0)
 
 
-def close_arduino(board, dry_run: bool = False):
+def close_arduino(board, dry_run=False):
     if dry_run or board is None:
         return
     board.exit()
     print("Arduino disconnected.")
 
 
-# =============================================================================
-# PHANTOM CAMERA (pyphantom SDK — requires PCC running in external trigger mode)
-# =============================================================================
+# --- Camera ------------------------------------------------------------------
 
-def init_camera(dry_run: bool = False):
-    """Connect to Phantom camera via pyphantom SDK, configure for triggered capture."""
+def init_camera(dry_run=False):
     if dry_run:
         print("[DRY RUN] Camera init skipped")
         return None, None
@@ -287,15 +203,14 @@ def init_camera(dry_run: bool = False):
     ph = Phantom()
     if ph.camera_count == 0:
         raise RuntimeError(
-            "No Phantom camera found.\n"
-            "Ensure PCC is running, camera is connected, and external trigger mode is set."
+            "No Phantom camera found. "
+            "Open PCC, confirm camera is live, and set trigger mode to External."
         )
 
     cam = ph.Camera(0)
-    cam.resolution          = CAM_RESOLUTION
-    cam.frame_rate          = CAM_FRAME_RATE
-    cam.post_trigger_frames = 1   # capture 1 frame after hardware trigger fires
-    cam.partition_count     = 1   # 1 RAM cine slot, reused each position
+    # Resolution and frame rate are taken from PCC — no need to set them here.
+    cam.post_trigger_frames = 1
+    cam.partition_count     = 1
 
     try:
         model = cam.get_selector_string(utils.CamSelector.gsModel)
@@ -305,40 +220,26 @@ def init_camera(dry_run: bool = False):
     return ph, cam
 
 
-def capture_and_retrieve(cam, dry_run: bool = False) -> np.ndarray:
-    """
-    Arm the camera for the next hardware trigger, wait for capture, return frame
-    as a 2-D numpy array (H, W).
+def arm_camera(cam, dry_run=False):
+    """Arm camera for the next hardware trigger. Call before trigger()."""
+    if dry_run:
+        return
+    cam.record()
+    time.sleep(0.1)
 
-    Call BEFORE wait_for_position_then_trigger so the camera is armed
-    when the D8 pulse fires.
-    """
+
+def get_frame(cam, dry_run=False):
+    """Read frame from camera RAM after trigger has fired."""
     if dry_run:
         return np.zeros((128, 128), dtype=np.uint16)
-
     from pyphantom import utils
-
-    cam.record()            # arm camera — starts filling pre-trigger ring buffer
-    time.sleep(0.1)         # allow arm to complete before trigger fires
-
-
-def retrieve_frame(cam, dry_run: bool = False) -> np.ndarray:
-    """Read the captured frame from camera RAM after trigger has fired."""
-    if dry_run:
-        return np.zeros((128, 128), dtype=np.uint16)
-
-    from pyphantom import utils
-
-    time.sleep(CAPTURE_WAIT_S)   # wait for single-frame capture to complete
-    cine1 = cam.Cine(1)
-    images = cine1.get_images(utils.FrameRange(
-        cine1.range.last_image,
-        cine1.range.last_image    # single frame
-    ))
-    return np.squeeze(images)    # (H, W) for monochrome
+    time.sleep(CAPTURE_WAIT_S)
+    cine = cam.Cine(1)
+    images = cine.get_images(utils.FrameRange(cine.range.last_image, cine.range.last_image))
+    return np.squeeze(images)
 
 
-def close_camera(ph, cam, dry_run: bool = False):
+def close_camera(ph, cam, dry_run=False):
     if dry_run or cam is None:
         return
     try:
@@ -350,25 +251,15 @@ def close_camera(ph, cam, dry_run: bool = False):
     print("Camera disconnected.")
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# --- Main --------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Calibration capture: KDC101 stage scan + Phantom camera trigger",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument('--dry-run', action='store_true',
-                   help="Test logic without moving hardware")
-    p.add_argument('--start',   type=float, default=START_MM,
-                   help=f"Start position in mm (default: {START_MM})")
-    p.add_argument('--end',     type=float, default=END_MM,
-                   help=f"End position in mm (default: {END_MM})")
-    p.add_argument('--step',    type=float, default=STEP_MM,
-                   help=f"Step size in mm (default: {STEP_MM})")
-    p.add_argument('--out',     type=str,   default=None,
-                   help="Override output directory path")
+    p = argparse.ArgumentParser(description="KDC101 stage scan + Phantom camera capture")
+    p.add_argument('--dry-run', action='store_true', help="Simulate without hardware")
+    p.add_argument('--start', type=float, default=START_MM)
+    p.add_argument('--end',   type=float, default=END_MM)
+    p.add_argument('--step',  type=float, default=STEP_MM)
+    p.add_argument('--out',   type=str,   default=None, help="Output directory")
     return p.parse_args()
 
 
@@ -379,101 +270,68 @@ def main():
     positions = np.arange(args.start, args.end + args.step / 2, args.step)
     n_pos = len(positions)
 
-    # Output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if args.out:
-        output_dir = Path(args.out)
-    else:
-        OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
-        output_dir = OUTPUT_BASE_DIR / f"capture_{timestamp}"
+    output_dir = Path(args.out) if args.out else OUTPUT_BASE_DIR / f"capture_{timestamp}"
+    OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 60)
-    print("  Calibration Capture Script")
-    print("=" * 60)
-    print(f"  Output:    {output_dir}")
-    print(f"  Positions: {n_pos}  ({args.start:.1f} → {args.end:.1f} mm, step {args.step:.1f} mm)")
-    if TRIGGER_MODE == 1:
-        print(f"  Trigger:   Mode 1 — D13 hardware signal (Arduino D13 ← KDC101 rear I/O)")
-    else:
-        print(f"  Trigger:   Mode 2 — SDK settling ({SETTLE_S}s after MoveTo, no D13 wiring)")
+    trigger_desc = (
+        "Mode 1 — D13 hardware signal" if TRIGGER_MODE == 1
+        else f"Mode 2 — SDK settling ({SETTLE_S}s)"
+    )
+    print(f"\nCapture: {n_pos} positions  {args.start:.1f}–{args.end:.1f} mm  |  {trigger_desc}")
+    print(f"Output:  {output_dir}")
     if dry_run:
-        print("  *** DRY RUN — no hardware will be moved or triggered ***")
-    print("=" * 60)
+        print("DRY RUN — no hardware will move\n")
 
-    # ── Pre-flight: connect all hardware before starting loop ─────────────
-    device          = init_stage(dry_run)
-    board, d8, d13  = init_arduino(dry_run)
-    ph, cam         = init_camera(dry_run)
+    device         = init_stage(dry_run)
+    board, d8, d13 = init_arduino(dry_run)
+    ph, cam        = init_camera(dry_run)
 
-    # ── Graceful Ctrl-C: park stage and disconnect ────────────────────────
     interrupted = [False]
-
-    def _on_interrupt(sig, frame):
+    def _stop(_sig, _frame):
         interrupted[0] = True
-        tqdm.write("\nInterrupted by user — finishing current position then cleaning up...")
+        tqdm.write("\nStopping after this position...")
+    signal.signal(signal.SIGINT, _stop)
 
-    signal.signal(signal.SIGINT, _on_interrupt)
-
-    # ── Capture loop ──────────────────────────────────────────────────────
     log_rows = []
     try:
         for idx, target_mm in enumerate(tqdm(positions, desc="Capturing", unit="pos")):
             if interrupted[0]:
-                tqdm.write("Stopping early at user request.")
                 break
 
-            tqdm.write(f"  [{idx+1}/{n_pos}]  target: {target_mm:.1f} mm")
-
-            # 1. Move stage (blocking — motor command done, may not be mechanically settled)
+            tqdm.write(f"  {target_mm:.1f} mm")
             move_stage(device, target_mm, dry_run)
-
-            # 2. Arm camera (do this while stage is settling, before trigger fires)
-            capture_and_retrieve(cam, dry_run)
-
-            # 3. Confirm stage settled (Mode 1: D13 HIGH / Mode 2: SDK settle sleep)
-            #    then pulse D8 to trigger the camera
-            wait_for_position_then_trigger(d8, d13, dry_run)
-
-            # 4. Query actual position (after settle confirmed)
+            arm_camera(cam, dry_run)
+            trigger(d8, d13, dry_run)
             actual_mm = get_stage_position(device, dry_run)
+            img = get_frame(cam, dry_run)
 
-            # 5. Retrieve captured frame from camera RAM
-            img = retrieve_frame(cam, dry_run)
-
-            # 6. Save as 16-bit TIFF
             filename = f"pos_{idx:03d}_{target_mm:.1f}mm.tiff"
-            filepath = output_dir / filename
             if not dry_run:
-                cv2.imwrite(str(filepath), img)
+                cv2.imwrite(str(output_dir / filename), img)
             else:
-                tqdm.write(f"  [DRY RUN] Would save: {filename}")
+                tqdm.write(f"  [DRY RUN] {filename}")
 
-            # 7. Log position
             log_rows.append({
                 'filename':          filename,
                 'stage_position_mm': round(actual_mm, 4),
                 'target_mm':         round(target_mm, 4),
             })
-            tqdm.write(f"  → saved: {filename}  (actual: {actual_mm:.4f} mm)")
+            tqdm.write(f"  → {filename}  (actual {actual_mm:.4f} mm)")
 
     finally:
-        # ── Write positions CSV ───────────────────────────────────────────
         if log_rows:
             csv_path = output_dir / 'positions.csv'
             with open(csv_path, 'w', newline='') as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=['filename', 'stage_position_mm', 'target_mm']
-                )
+                writer = csv.DictWriter(f, fieldnames=['filename', 'stage_position_mm', 'target_mm'])
                 writer.writeheader()
                 writer.writerows(log_rows)
-            print(f"\nSaved {len(log_rows)}/{n_pos} positions → {csv_path}")
+            print(f"\n{len(log_rows)}/{n_pos} positions saved → {csv_path}")
 
-        # ── Disconnect hardware ───────────────────────────────────────────
         close_stage(device, dry_run)
         close_arduino(board, dry_run)
         close_camera(ph, cam, dry_run)
-        print("Done.")
 
 
 if __name__ == '__main__':

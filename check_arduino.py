@@ -1,19 +1,17 @@
 """
 check_arduino.py
-================
+----------------
+Arduino pre-flight check. Run before every lab session.
 
-One-stop Arduino verification script. Run this before every lab session.
-
-What it does:
-  1. Lists all COM ports and flags any that look like an Arduino
+  1. Lists COM ports and flags any that look like an Arduino
   2. Connects via pyfirmata and confirms StandardFirmata is loaded
-  3. Blinks D8 five times (camera trigger output) — verify on oscilloscope/LED
-  4. Reads D13 for 10 seconds (stage in-position input) — jumper 5V→D13 to test
+  3. Blinks D8 five times — verify with oscilloscope or LED
+  4. Reads D13 for 10 s — jumper 5V→D13 to simulate stage in-position
 
-Usage:
-  python check_arduino.py               # auto-detects Arduino COM port
-  python check_arduino.py --port COM5   # specify port manually
-  python check_arduino.py --no-pins     # firmware check only, skip pin tests
+Usage
+  python check_arduino.py               # auto-detect port
+  python check_arduino.py --port COM5   # specify port
+  python check_arduino.py --no-pins     # firmware check only
 """
 
 import argparse
@@ -50,7 +48,6 @@ def run_checks(port: str, test_pins: bool):
         print("ERROR: pyfirmata not installed.  Run: pip install pyfirmata")
         return
 
-    # ── Step 1: Connect and check firmware ───────────────────────────────────
     print(f"\n[1/3] Connecting to {port}...")
     try:
         board = pyfirmata.Arduino(port)
@@ -86,7 +83,6 @@ def run_checks(port: str, test_pins: bool):
     d13 = board.get_pin('d:13:i')   # input:  stage in-position signal
     d8.write(0)
 
-    # ── Step 2: Blink D8 ─────────────────────────────────────────────────────
     print(f"\n[2/3] Blinking D8 {BLINK_COUNT} times ({BLINK_MS} ms each)...")
     print("  Verify with oscilloscope or LED on D8.")
     print("  (The on-board 'L' LED will NOT light — it is on D13, not D8.)\n")
@@ -99,7 +95,6 @@ def run_checks(port: str, test_pins: bool):
     d8.write(0)
     print("  D8 test complete.")
 
-    # ── Step 3: Read D13 ─────────────────────────────────────────────────────
     print(f"\n[3/3] Reading D13 for {D13_READ_S} s (stage in-position input)...")
     print("  In the lab: D13 goes HIGH once the KDC101 stage reaches its target position.")
     print("  To test now: jumper a wire from Arduino 5V pin → D13 to simulate HIGH.\n")
@@ -126,7 +121,6 @@ def main():
     parser.add_argument('--no-pins',  action='store_true', help="Skip D8/D13 pin tests")
     args = parser.parse_args()
 
-    # ── List all ports ────────────────────────────────────────────────────────
     ports = list_ports()
     print("COM ports detected:")
     if not ports:
