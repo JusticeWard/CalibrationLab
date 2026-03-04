@@ -1,10 +1,16 @@
 # Calibration Capture Script — Dependencies
 #
+# Requires Python 3.11 (pyphantom wheel is locked to py311).
+# Use setup_lab_env.bat to create the phantom_env virtual environment automatically.
+#
 # Install pyphantom from the local Phantom SDK wheel (not on PyPI):
 #   pip install "C:\Users\justi\OneDrive\My Documents\Phantom\PhSDK11\Python\pyphantom-3.11.11.806-py311-none-any.whl"
 #
 # Then install the rest:
 #   pip install -r requirements.txt
+#
+# Note: pyfirmata 1.1.0 uses inspect.getargspec which was removed in Python 3.11.
+# All scripts in this folder patch this automatically — no manual fix needed.
 
 pythonnet>=3.0.3        # .NET interop for ThorLabs Kinesis DLLs
 pyfirmata>=1.1.0        # Arduino Firmata protocol (StandardFirmata firmware on Arduino)

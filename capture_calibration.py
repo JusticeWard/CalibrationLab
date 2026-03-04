@@ -11,16 +11,31 @@ Hardware connections
   KDC101 USB     → PC (Kinesis drivers)
   Phantom camera → PC (PCC software, Gigabit Ethernet)
   Arduino D8     → Camera BNC / hardware-trigger input   (camera trigger pulse)
-  Arduino D13    ← KDC101 rear I/O "in-position" output  (stage settled signal)
   Arduino GND    → Camera GND                             (common ground)
+
+  Mode 1 only:
+  Arduino D13    ← KDC101 rear I/O "in-position" output  (stage settled signal)
+
+Trigger modes
+-------------
+  TRIGGER_MODE = 1  (D13 hardware signal — recommended)
+    Arduino D13 reads the KDC101 rear I/O "in-position" TTL pin.
+    Script waits for D13 HIGH before firing D8. Most robust.
+
+  TRIGGER_MODE = 2  (SDK settling — no D13 wiring needed)
+    MoveTo() is a blocking call that returns only when the encoder confirms
+    the stage has reached its target. Script then waits SETTLE_S seconds for
+    mechanical vibration to damp before firing D8. Use this if the KDC101
+    rear I/O is inaccessible or you cannot wire D13.
 
 Before running
 --------------
-  1. Flash StandardFirmata to Arduino Uno
+  1. Set TRIGGER_MODE below (1 or 2)
+  2. Flash StandardFirmata to Arduino Uno
        Arduino IDE → File → Examples → Firmata → StandardFirmata → Upload
-  2. Open PCC, connect camera, set trigger mode to External (hardware trigger)
-  3. Edit the CONFIGURATION block below (ARDUINO_PORT, STAGE_SERIAL, etc.)
-  4. Confirm STAGE_CONFIG_NAME matches your actuator name in Kinesis software
+  3. Open PCC, connect camera, set trigger mode to External (hardware trigger)
+  4. Edit the CONFIGURATION block below (ARDUINO_PORT, STAGE_SERIAL, etc.)
+  5. Confirm STAGE_CONFIG_NAME matches your actuator name in Kinesis software
 
 Usage
 -----
@@ -44,8 +59,13 @@ import time
 import csv
 import argparse
 import signal
+import inspect
 from pathlib import Path
 from datetime import datetime
+
+# pyfirmata uses inspect.getargspec which was removed in Python 3.11
+if not hasattr(inspect, 'getargspec'):
+    inspect.getargspec = inspect.getfullargspec
 
 import numpy as np
 import cv2
@@ -56,21 +76,32 @@ from tqdm import tqdm
 # CONFIGURATION — edit these before each lab session
 # =============================================================================
 
-ARDUINO_PORT      = 'COM3'         # Arduino COM port (check Device Manager)
+# ── Trigger mode ──────────────────────────────────────────────────────────────
+TRIGGER_MODE = 1
+# 1 — D13 hardware signal (recommended if KDC101 rear I/O is wired to Arduino D13)
+# 2 — SDK settling only   (no D13 wiring needed; relies on MoveTo() blocking call)
+
+SETTLE_S          = 0.1            # Mode 2 only: seconds to wait after MoveTo() before triggering
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+ARDUINO_PORT      = 'COM3'         # Arduino COM port (check Device Manager → USB-SERIAL CH340)
 STAGE_SERIAL      = '27XXXXXX'     # 8-digit serial number on KDC101 label
 KINESIS_DLL_PATH  = r'C:\Program Files\Thorlabs\Kinesis'
 STAGE_CONFIG_NAME = 'Z825B'        # actuator model name saved in Kinesis software
                                    # (e.g. 'Z825B' for 25mm, 'Z812B' for 12mm)
 
+# ── Scan parameters ───────────────────────────────────────────────────────────
 START_MM          = 0.0            # scan start position (mm)
 END_MM            = 12.0           # scan end position (mm)
 STEP_MM           = 0.2            # step size (mm) → 61 positions
 
+# ── Camera ────────────────────────────────────────────────────────────────────
 CAM_RESOLUTION    = (1024, 1024)   # camera resolution — match your PCC setting
 CAM_FRAME_RATE    = 100            # frames per second
 
+# ── Timing ────────────────────────────────────────────────────────────────────
 TRIGGER_PULSE_MS  = 50             # D8 HIGH duration (ms)
-TRIGGER_TIMEOUT_S = 15.0           # max time to wait for D13 (stage in-position)
+TRIGGER_TIMEOUT_S = 15.0           # Mode 1 only: max time to wait for D13 (stage in-position)
 CAPTURE_WAIT_S    = 0.5            # wait after D8 trigger before reading cine from RAM
 MOVE_TIMEOUT_MS   = 20000          # max time per MoveTo call (ms)
 
@@ -129,7 +160,10 @@ def init_stage(dry_run: bool = False):
 
 
 def move_stage(device, target_mm: float, dry_run: bool = False):
-    """Send blocking move command. Returns when motor command completes (not necessarily settled)."""
+    """Blocking move. Returns when the encoder confirms the stage has entered the target
+    position window. The stage is at the target but may still have residual oscillation
+    (PID ringing). Mode 1 uses the D13 signal which waits for the window to be held for
+    a Kinesis-configured settling time. Mode 2 adds SETTLE_S manually for the same reason."""
     if dry_run:
         return
     from System import Decimal
@@ -162,7 +196,7 @@ def close_stage(device, dry_run: bool = False):
 # =============================================================================
 
 def init_arduino(dry_run: bool = False):
-    """Connect to Arduino, set up D8 (output) and D13 (input)."""
+    """Connect to Arduino. D8 output always; D13 input only in Mode 1."""
     if dry_run:
         print("[DRY RUN] Arduino init skipped")
         return None, None, None
@@ -176,35 +210,54 @@ def init_arduino(dry_run: bool = False):
     it.start()
     time.sleep(2)                        # allow Firmata handshake to complete
 
-    d8  = board.get_pin('d:8:o')        # output: camera trigger pulse
-    d13 = board.get_pin('d:13:i')       # input:  stage "in position" signal
+    d8 = board.get_pin('d:8:o')         # output: camera trigger pulse
     d8.write(0)                          # ensure trigger starts LOW
-    print("Arduino connected.")
+
+    if TRIGGER_MODE == 1:
+        d13 = board.get_pin('d:13:i')   # input: stage "in position" signal
+        print("Arduino connected (Mode 1: D8 + D13).")
+    else:
+        d13 = None
+        print("Arduino connected (Mode 2: D8 only — D13 not used).")
+
     return board, d8, d13
 
 
 def wait_for_position_then_trigger(d8, d13, dry_run: bool = False):
     """
-    Wait until D13 goes HIGH (stage physically settled at target position),
-    then pulse D8 HIGH briefly to trigger the camera.
+    Confirm the stage is settled at its target position, then pulse D8 to trigger camera.
 
-    D13 LOW  = stage still moving or settling → keep waiting
-    D13 HIGH = stage confirmed in position    → fire camera trigger
+    Mode 1 — D13 hardware signal:
+      Polls Arduino D13 until HIGH (KDC101 "in-position" TTL output).
+      D13 LOW  = stage still moving or settling → keep waiting
+      D13 HIGH = stage confirmed in position    → fire trigger
+
+    Mode 2 — SDK settling:
+      MoveTo() is blocking and already confirmed in-position via encoder feedback.
+      Waits SETTLE_S seconds for mechanical vibration to damp, then fires trigger.
     """
     if dry_run:
-        tqdm.write("  [DRY RUN] Wait D13 high, pulse D8")
+        if TRIGGER_MODE == 1:
+            tqdm.write("  [DRY RUN] Wait D13 HIGH, pulse D8")
+        else:
+            tqdm.write(f"  [DRY RUN] Sleep {SETTLE_S}s (Mode 2 settle), pulse D8")
         return
 
-    t0 = time.time()
-    while (d13.read() or 0.0) < 0.5:    # wait while NOT in position
-        time.sleep(0.001)
-        if time.time() - t0 > TRIGGER_TIMEOUT_S:
-            raise TimeoutError(
-                f"Stage did not reach position within {TRIGGER_TIMEOUT_S:.0f} s — "
-                f"check D13 wiring (KDC101 rear I/O 'in-position' output → Arduino D13).\n"
-                f"If your signal is active-LOW, flip the < 0.5 condition to > 0.5 in "
-                f"wait_for_position_then_trigger()."
-            )
+    if TRIGGER_MODE == 1:
+        t0 = time.time()
+        while (d13.read() or 0.0) < 0.5:    # wait while NOT in position
+            time.sleep(0.001)
+            if time.time() - t0 > TRIGGER_TIMEOUT_S:
+                raise TimeoutError(
+                    f"Stage did not reach position within {TRIGGER_TIMEOUT_S:.0f} s — "
+                    f"check D13 wiring (KDC101 rear I/O 'in-position' output → Arduino D13).\n"
+                    f"If your signal is active-LOW, flip the < 0.5 condition to > 0.5 in "
+                    f"wait_for_position_then_trigger()."
+                )
+    else:
+        # Mode 2: MoveTo() has already confirmed in-position via encoder.
+        # Short sleep lets any mechanical ringing damp before the shutter fires.
+        time.sleep(SETTLE_S)
 
     # Stage confirmed in position — fire the camera trigger
     d8.write(1)
@@ -340,6 +393,10 @@ def main():
     print("=" * 60)
     print(f"  Output:    {output_dir}")
     print(f"  Positions: {n_pos}  ({args.start:.1f} → {args.end:.1f} mm, step {args.step:.1f} mm)")
+    if TRIGGER_MODE == 1:
+        print(f"  Trigger:   Mode 1 — D13 hardware signal (Arduino D13 ← KDC101 rear I/O)")
+    else:
+        print(f"  Trigger:   Mode 2 — SDK settling ({SETTLE_S}s after MoveTo, no D13 wiring)")
     if dry_run:
         print("  *** DRY RUN — no hardware will be moved or triggered ***")
     print("=" * 60)
@@ -371,10 +428,11 @@ def main():
             # 1. Move stage (blocking — motor command done, may not be mechanically settled)
             move_stage(device, target_mm, dry_run)
 
-            # 2. Arm camera (do this while stage is settling, before D13 fires)
+            # 2. Arm camera (do this while stage is settling, before trigger fires)
             capture_and_retrieve(cam, dry_run)
 
-            # 3. Wait for D13 HIGH (stage physically settled) then pulse D8 (camera trigger)
+            # 3. Confirm stage settled (Mode 1: D13 HIGH / Mode 2: SDK settle sleep)
+            #    then pulse D8 to trigger the camera
             wait_for_position_then_trigger(d8, d13, dry_run)
 
             # 4. Query actual position (after settle confirmed)

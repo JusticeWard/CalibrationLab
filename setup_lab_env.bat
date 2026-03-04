@@ -111,8 +111,8 @@ echo   Then test without hardware:
 echo.
 echo     python capture_calibration.py --dry-run
 echo.
-echo   And test the Arduino (plug it in first):
+echo   Run the Arduino pre-flight check (plug it in first):
 echo.
-echo     python test_arduino.py --port COM4
+echo     python check_arduino.py
 echo.
 pause
